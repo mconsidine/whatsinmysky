@@ -26,7 +26,7 @@ warnings.filterwarnings("ignore")
 class WhatsInMySky:
     def __init__(self, root):
         self.root = root
-        self.root.title("What's In My Sky v1.2 - Seti Astro")
+        self.root.title("What's In My Sky v1.3 - Seti Astro")
 
         # Load previous settings
         self.settings_file = os.path.join(os.path.expanduser("~"), "sky_settings.json")
@@ -64,12 +64,19 @@ class WhatsInMySky:
         self.timezone_combo.grid(row=4, column=1, padx=5, pady=5)
         self.timezone_combo.set(self.settings.get("timezone", "UTC"))
 
-        # Catalog Filters Frame
+        # Minimum Altitude Input Field
+        self.min_altitude_label = tk.Label(root, text="Min Altitude (0-90 degrees):")
+        self.min_altitude_label.grid(row=5, column=0, padx=5, pady=5, sticky='e')
+        self.min_altitude_entry = tk.Entry(root)
+        self.min_altitude_entry.grid(row=5, column=1, padx=5, pady=5)
+        self.min_altitude_entry.insert(0, self.settings.get("min_altitude", "0"))
+
+        # Catalog Filters
         self.catalog_filters_label = tk.Label(root, text="Catalog Filters:")
-        self.catalog_filters_label.grid(row=5, column=0, padx=5, pady=5, sticky='w')
-        
+        self.catalog_filters_label.grid(row=6, column=0, padx=5, pady=5, sticky='w')
+
         self.catalog_frame = tk.Frame(root)
-        self.catalog_frame.grid(row=6, column=0, columnspan=2, padx=5, pady=5, sticky='w')
+        self.catalog_frame.grid(row=7, column=0, columnspan=3, padx=5, pady=5, sticky='w')
 
         self.catalog_vars = {}
         catalogs = ["Messier", "NGC", "IC", "Caldwell", "Abell", "Sharpless", "LBN", "LDN", "PNG", "User"]
@@ -78,6 +85,7 @@ class WhatsInMySky:
             chk = tk.Checkbutton(self.catalog_frame, text=catalog, variable=var)
             chk.grid(row=i // 5, column=i % 5, padx=5, pady=5, sticky='w')
             self.catalog_vars[catalog] = var
+
 
         # RA/Dec Format Frame
         self.ra_dec_frame = tk.Frame(root)
@@ -165,9 +173,10 @@ class WhatsInMySky:
             date_str = self.date_entry.get()
             time_str = self.time_entry.get()
             timezone_str = self.timezone_combo.get()
+            min_altitude = float(self.min_altitude_entry.get())
 
             # Save settings
-            self.save_settings(latitude, longitude, date_str, time_str, timezone_str)
+            self.save_settings(latitude, longitude, date_str, time_str, timezone_str, min_altitude)
 
             # Combine date and time
             datetime_str = f"{date_str} {time_str}"
@@ -216,6 +225,20 @@ class WhatsInMySky:
             selected_catalogs = [catalog for catalog, var in self.catalog_vars.items() if var.get()]
             df = df[df['Catalog'].isin(selected_catalogs)]
 
+            # Filter by RA within +/- 6 hours of LST
+            ra_threshold = 6  # Hours
+            lst_ra_lower = (lst.hour - ra_threshold) % 24
+            lst_ra_upper = (lst.hour + ra_threshold) % 24
+
+            if lst_ra_lower < lst_ra_upper:
+                df = df[(df['RA'] >= lst_ra_lower) & (df['RA'] <= lst_ra_upper)]
+            else:  # This handles the wraparound case, e.g., LST near 0 or 24 hours
+                df = df[(df['RA'] >= lst_ra_lower) | (df['RA'] <= lst_ra_upper)]
+
+            if df.empty:
+                self.update_status("No celestial objects are within +/- 6 hours of Local Sidereal Time.")
+                return
+
             # Calculate Altitude, Azimuth, and Degrees from Moon for each object
             altaz_frame = AltAz(obstime=astropy_time, location=location)
             altitudes, azimuths, minutes_to_transit, before_after_transit, degrees_from_moon = [], [], [], [], []
@@ -229,13 +252,14 @@ class WhatsInMySky:
                 azimuths.append(round(altaz.az.deg, 1))
 
                 # Calculate time difference to transit
-                ra = Decimal(row['RA']) * Decimal(u.deg.to(u.hourangle))  # Convert RA from degrees to hour angle
-                time_diff = (ra - Decimal(lst.hour)) % Decimal(24)
-                if time_diff < 0:
+                ra = row['RA'] * u.deg.to(u.hourangle)  # Convert RA from degrees to hour angle
+                time_diff = ((ra - lst.hour) * u.hour) % (24 * u.hour)
+                minutes = round(time_diff.value * 60, 1)
+                if minutes > 720:
+                    minutes = 1440 - minutes
                     before_after_transit.append("After")
                 else:
                     before_after_transit.append("Before")
-                minutes = round(abs(time_diff) * Decimal(60))
                 minutes_to_transit.append(minutes)
 
                 # Calculate angular distance from the moon
@@ -248,11 +272,11 @@ class WhatsInMySky:
             df['Before/After Transit'] = before_after_transit
             df['Degrees from Moon'] = degrees_from_moon
 
-            # Filter out objects below the horizon
-            df = df[df['Altitude'] > 0]
+            # Filter out objects below user-defined altitude
+            df = df[df['Altitude'] >= min_altitude]
 
             if df.empty:
-                self.update_status("No celestial objects are above the horizon at this time.")
+                self.update_status("No celestial objects are above the specified minimum altitude at this time.")
                 return
 
             # Sort by absolute minutes to transit
@@ -315,6 +339,13 @@ class WhatsInMySky:
         phase_percentage = (1 - np.cos(np.radians(elongation))) / 2 * 100
         phase_percentage = round(phase_percentage)
 
+        # Determine if it is waxing or waning by comparing current elongation to future elongation
+        future_time = astropy_time + (6 * u.hour)
+        future_moon = get_body("moon", future_time, location)
+        future_sun = get_sun(future_time)
+        future_elongation = future_moon.separation(future_sun).deg
+        is_waxing = future_elongation > elongation
+
         # Select appropriate lunar phase image based on phase angle
         phase_folder = os.path.join(sys._MEIPASS, "imgs") if getattr(sys, 'frozen', False) else os.path.join(os.path.dirname(__file__), "imgs")
         phase_image_name = "new_moon.png"  # Default
@@ -322,47 +353,27 @@ class WhatsInMySky:
         if 0 <= elongation < 9:
             phase_image_name = "new_moon.png"
         elif 9 <= elongation < 18:
-            phase_image_name = "waxing_crescent_1.png"
+            phase_image_name = "waxing_crescent_1.png" if is_waxing else "waning_crescent_5.png"
         elif 18 <= elongation < 27:
-            phase_image_name = "waxing_crescent_2.png"
+            phase_image_name = "waxing_crescent_2.png" if is_waxing else "waning_crescent_4.png"
         elif 27 <= elongation < 36:
-            phase_image_name = "waxing_crescent_3.png"
+            phase_image_name = "waxing_crescent_3.png" if is_waxing else "waning_crescent_3.png"
         elif 36 <= elongation < 45:
-            phase_image_name = "waxing_crescent_4.png"
+            phase_image_name = "waxing_crescent_4.png" if is_waxing else "waning_crescent_2.png"
         elif 45 <= elongation < 54:
-            phase_image_name = "waxing_crescent_5.png"
+            phase_image_name = "waxing_crescent_5.png" if is_waxing else "waning_crescent_1.png"
         elif 54 <= elongation < 90:
             phase_image_name = "first_quarter.png"
         elif 90 <= elongation < 108:
-            phase_image_name = "waxing_gibbous_1.png"
+            phase_image_name = "waxing_gibbous_1.png" if is_waxing else "waning_gibbous_4.png"
         elif 108 <= elongation < 126:
-            phase_image_name = "waxing_gibbous_2.png"
+            phase_image_name = "waxing_gibbous_2.png" if is_waxing else "waning_gibbous_3.png"
         elif 126 <= elongation < 144:
-            phase_image_name = "waxing_gibbous_3.png"
+            phase_image_name = "waxing_gibbous_3.png" if is_waxing else "waning_gibbous_2.png"
         elif 144 <= elongation < 162:
-            phase_image_name = "waxing_gibbous_4.png"
-        elif 162 <= elongation < 180:
+            phase_image_name = "waxing_gibbous_4.png" if is_waxing else "waning_gibbous_1.png"
+        elif 162 <= elongation <= 180:
             phase_image_name = "full_moon.png"
-        elif 180 <= elongation < 198:
-            phase_image_name = "waning_gibbous_1.png"
-        elif 198 <= elongation < 216:
-            phase_image_name = "waning_gibbous_2.png"
-        elif 216 <= elongation < 234:
-            phase_image_name = "waning_gibbous_3.png"
-        elif 234 <= elongation < 252:
-            phase_image_name = "waning_gibbous_4.png"
-        elif 252 <= elongation < 270:
-            phase_image_name = "last_quarter.png"
-        elif 270 <= elongation < 279:
-            phase_image_name = "waning_crescent_1.png"
-        elif 279 <= elongation < 288:
-            phase_image_name = "waning_crescent_2.png"
-        elif 288 <= elongation < 297:
-            phase_image_name = "waning_crescent_3.png"
-        elif 297 <= elongation < 306:
-            phase_image_name = "waning_crescent_4.png"
-        elif 306 <= elongation < 315:
-            phase_image_name = "waning_crescent_5.png"
 
         # Load and display the lunar phase image
         phase_image_path = os.path.join(phase_folder, phase_image_name)
@@ -382,13 +393,14 @@ class WhatsInMySky:
                 return json.load(f)
         return {}
 
-    def save_settings(self, latitude, longitude, date, time, timezone):
+    def save_settings(self, latitude, longitude, date, time, timezone, min_altitude):
         settings = {
             "latitude": latitude,
             "longitude": longitude,
             "date": date,
             "time": time,
             "timezone": timezone,
+            "min_altitude": min_altitude,
             "object_limit": self.object_limit
         }
         with open(self.settings_file, 'w') as f:
